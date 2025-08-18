@@ -64,7 +64,10 @@ function normalizeModules(apiModules = []) {
       deps,
       enabled: !!m.enabled,
       isMvp: !!m.isMvp,
-      obMode: m.obMode ?? null, // 'onb' | 'half' | null
+      obMode: (typeof m.obMode === 'string' ? m.obMode : (m.obMode ? String(m.obMode) : null)),
+      startWeek: Number.isFinite(Number(m.startWeek)) ? Number(m.startWeek) : 0,
+      // İstersen mevcut duration kolonunu da oku (gerekli değil ama silinmesin diye tutabiliriz)
+      duration: Number.isFinite(Number(m.duration)) ? Number(m.duration) : undefined,
     };
   });
 }
@@ -136,14 +139,11 @@ export default function Home(){
     setPw("");
   }
 
-  // Login formu (yalnızca role === null olduğunda gösterilecek; biz viewer başlattığımız için
-  // TopBar’daki Login butonuna basınca role=null yapıp bu formu göstereceğiz)
   if (role === null){
     return (
       <div style={{minHeight:'100vh', display:'grid', placeItems:'center', fontFamily:'Inter, system-ui, Arial', background:'#f9fafb'}}>
         <form onSubmit={handleLogin} style={{width:280, background:'#fff', border:'1px solid #e5e7eb', borderRadius:12, padding:16, boxShadow:'0 10px 24px rgba(0,0,0,0.05)'}}>
           <h1 style={{fontSize:18, fontWeight:800, marginBottom:10}}>Sign in</h1>
-          {/* İstendiği gibi bilgi yazısı kaldırıldı */}
           <input
             type="password"
             value={pw}
@@ -169,14 +169,11 @@ export default function Home(){
 function TopBar({ role, onLogout, onLogin }){
   return (
     <div style={{display:'flex', alignItems:'center', gap:10, padding:'8px 12px', borderBottom:'1px solid #e5e7eb', background:'#fff'}}>
-<div style={{ display: "flex", alignItems: "center", gap: "12px", fontWeight: 900 }}>
-  <img 
-    src="/logo.png" 
-    alt="Pixup Logo" 
-    style={{ height: "80px", width: "80px", objectFit: "contain" }} 
-  />
-  Roadmap
-</div>      <div style={{marginLeft:'auto', display:'flex', alignItems:'center', gap:8}}>
+      <div style={{ display: "flex", alignItems: "center", gap: "12px", fontWeight: 900 }}>
+        <img src="/logo.png" alt="Pixup Logo" style={{ height: 80, width: 80, objectFit: "contain" }} />
+        Roadmap
+      </div>
+      <div style={{marginLeft:'auto', display:'flex', alignItems:'center', gap:8}}>
         <span style={{
           fontSize:12, fontWeight:800, padding:'2px 8px', borderRadius:999,
           background: role==='admin' ? '#d1fae5' : '#e5e7eb', color:'#111827'
@@ -291,7 +288,50 @@ function DevGantt({ editable = true }){
     return [...rest.slice(0, idx), ...blockIds, ...rest.slice(idx)];
   }
 
-  // positions
+  // ----- startWeek -> offsets türet -----
+  function deriveOffsetsFromStartWeeks(mods, ord){
+    const byId = new Map((mods||[]).map(m => [m.id, m]));
+    const enabled = (ord||[]).map(id => byId.get(id)).filter(m => m && m.enabled);
+
+    let offsets = {};
+    let baseStarts = [];
+    let durations = [];
+
+    // 1) contiguous başlangıçlar (offset=0 kabul ederek)
+    let cur = 0;
+    enabled.forEach(m => {
+      const d = computeDuration(m);
+      durations.push(d);
+      baseStarts.push(cur);
+      cur += d;
+    });
+
+    // 2) hedef start: varsa startWeek, yoksa contiguous
+    const targetStarts = enabled.map((m, i) => (
+      Number.isFinite(Number(m.startWeek)) ? Number(m.startWeek) : baseStarts[i]
+    ));
+
+    // 3) kümülatif offset çöz
+    let cum = 0;
+    enabled.forEach((m, i) => {
+      const need = targetStarts[i] - (baseStarts[i] + cum);
+      if (need !== 0) {
+        offsets[m.id] = (offsets[m.id]||0) + need;
+        cum += need;
+      }
+    });
+    return offsets;
+  }
+
+  // İlk yüklemede startWeek'leri ekrana uygula (offsets kur)
+  useEffect(() => {
+    if (!modules || !order) return;
+    if (Object.keys(offsets||{}).length) return; // yalnızca ilk kurulumda
+    const init = deriveOffsetsFromStartWeeks(modules, order);
+    if (Object.keys(init).length) setOffsets(init);
+  }, [modules, order]); // eslint-disable-line
+
+  // positions (contiguous + incremental offsets)
   const positioned = useMemo(() => {
     let start = 0, cumulativeShift = 0;
     return enabledOrdered.map(m => {
@@ -354,7 +394,7 @@ function DevGantt({ editable = true }){
     const patch = { [role]: nextVal };
     if (nextVal > (m[role] ?? 0)) {
       const yes = window.confirm(
-        "Onboarding uygulanacak mı?\n\nOK = Evet (süre: ceil(base/2)+6)\nCancel = Hayır (süre: ceil(base/2))"
+        "Wiil onboarding Applied?\n\nOK = Yes (time: ceil(base/2)+6)\nCancel = No (time: ceil(base/2))"
       );
       patch.obMode = yes ? 'onb' : 'half';
     }
@@ -473,15 +513,15 @@ function DevGantt({ editable = true }){
     setSwapId(null);
   }
 
-  // group nudge with keyboard
+  // ========== ÖNEMLİ: Kartı itince yalnızca o karta offset veriyoruz ==========
+  // Böylece positioned()'daki cumulativeShift, bu karttan SONRAKİ tüm modülleri
+  // otomatik aynı miktarda taşır → boşluk kalmaz.
   function nudgeGroupFrom(id, dw){
     if (!editable) return;
     if (!dw) return;
-    const ids = getConnectedIds(id);
-    setOffsets(prev => {
-      const next = { ...(prev||{}) }; ids.forEach(k => { next[k] = (next[k]||0) + dw; }); return next;
-    });
+    setOffsets(prev => ({ ...(prev||{}), [id]: (prev?.[id]||0) + dw }));
   }
+
   useEffect(() => {
     function onKey(e){
       if (!editable) return;
@@ -503,6 +543,42 @@ function DevGantt({ editable = true }){
     const newColW = Math.max(24, Math.floor(availableWidth / weeks));
     setColW(newColW);
   }
+
+// ---- SAVE ORDER: positioned.start -> startWeek, tek POST ile kalıcı ----
+function saveAllStartWeeks(){
+  const startMap = new Map((positioned || []).map(
+    p => [p.id, Math.max(0, Math.round(p.start))]
+  ));
+
+  const updatedModules = (modules || []).map(m => {
+    const sw = startMap.has(m.id) ? startMap.get(m.id) : m.startWeek;
+    return {
+      ...m,
+        startWeek: Number.isFinite(Number(sw)) ? Number(sw) : 0,
+    obMode: m.obMode ? String(m.obMode) : "",
+    duration: Number(computeDuration(m)),
+    };
+  });
+
+  setModules(updatedModules);
+
+  fetch("/api/sheets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      order,
+    modules: updatedModules.map(m => ({
+
+        id: m.id,
+        name: m.name,
+        startWeek: Number(m.startWeek),
+      obMode: m.obMode,           // "" | "onb" | "half"
+      duration: Number(m.duration)
+    })),
+    forceColumns: ["startWeek","obMode","duration"]
+  }),
+}).catch(()=>{});
+}
 
   // check-all (Timeline & Modules)
   const allEnabledTimeline = (modules||[]).every(m => m.isMvp || m.enabled);
@@ -550,6 +626,24 @@ function DevGantt({ editable = true }){
           <button onClick={()=>zoom(-6)} title="Zoom out" style={iconBtn()}>−</button>
           <button onClick={()=>zoom(+6)} title="Zoom in"  style={iconBtn()}>+</button>
           <button onClick={fitToScreen} title="Fit to screen" style={iconBtn()}>⤢</button>
+
+          {/* YENİ: Save Order (sadece admin aktif) */}
+          <button
+            onClick={saveAllStartWeeks}
+            disabled={!editable}
+            title="Save current order & positions"
+            style={{
+              padding:'6px 10px',
+              border:'1px solid #e5e7eb',
+              borderRadius:8,
+              background: editable ? '#111827' : '#fff',
+              color: editable ? '#fff' : '#111827',
+              fontWeight:800,
+              cursor: editable ? 'pointer' : 'default'
+            }}>
+            Save Order
+          </button>
+
           <div style={{ fontWeight: 800, marginLeft: 8 }}>Total: {totalWeeks} weeks</div>
         </div>
       </div>
@@ -763,8 +857,7 @@ function TimelineView({
               const tColor = textColorFor(m.color);
               const resText = formatRes(m);
               const tip = `${m.name}\n${m.desc ? m.desc + '\n' : ''}${resText ? resText + ' • ' : ''}${m.duration} weeks${m.obMode==='onb' ? ' • OnB' : (m.obMode==='half' ? ' • Half' : '')}`;
-              const labelText = (resText || ' ') + (m.obMode==='onb' ? '  OnB' : '');
-              return (
+              const labelText = (resText || ' ');              return (
                 <div key={m.id}
                      onMouseDown={(e)=>{ if(!editable) return; draggingRef.current = { id: m.id, startX: e.clientX }; setIsGrabbing(true); }}
                      onTouchStart={(e)=>{ if(!editable) return; const t=e.touches[0]; draggingRef.current = { id: m.id, startX: t.clientX }; setIsGrabbing(true); }}
@@ -792,11 +885,7 @@ function TimelineView({
                        userSelect: 'none'
                      }}
                      title={tip}>
-                  {/* MVP star (sol üst, siyah) */}
-                  {m.isMvp && (
-                    <div style={{position:'absolute', left:6, top:6, fontSize:14, color:'#000'}}>★</div>
-                  )}
-                  {/* OnB badge (sağ üst) */}
+                  {m.isMvp && <div style={{position:'absolute', left:6, top:6, fontSize:14, color:'#000'}}>★</div>}
                   {m.obMode==='onb' && (
                     <div style={{
                       position:'absolute', right:6, top:6,
@@ -806,7 +895,9 @@ function TimelineView({
                     }}>OnB</div>
                   )}
                   <div style={{ fontWeight: 800, fontSize: titleFont, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', wordBreak: 'break-word', padding: '0 6px', maxHeight: '2.2em' }}>{m.name}</div>
-                  <div style={{ marginTop: 4, fontSize: 12, fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', padding: '2px 6px', borderRadius: 6, backgroundColor: 'rgba(0,0,0,0.36)', color: '#fff', alignSelf: 'center' }}>{labelText}</div>
+                  <div style={{ marginTop: 4, fontSize: 12, fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', padding: '2px 6px', borderRadius: 6, backgroundColor: 'rgba(0,0,0,0.36)', color: '#fff', alignSelf: 'center' }}>
+                    {(resText || ' ') + (m.obMode==='onb' ? '  OnB' : '')}
+                  </div>
                 </div>
               );
             })}
