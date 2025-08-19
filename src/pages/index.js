@@ -4,9 +4,6 @@ import React, { useMemo, useRef, useState, useEffect } from "react";
 /** PERFECT + Login (admin/viewer)
  * - Şifreler: admin123 (tam yetki), user123 (view-only)
  * - Rol localStorage’ta saklanır
- * - İlk açılışta: role yoksa otomatik **viewer** başlar (view-only)
- * - Admin: tüm aksiyonlar açık, Sheets POST autosave aktif
- * - Viewer: tüm UI girişleri kilitli, POST autosave kapalı
  */
 
 // ====== Layout ======
@@ -35,16 +32,27 @@ function formatRes(m){
 function randomHex(){ return "#"+Math.floor(Math.random()*0xffffff).toString(16).padStart(6,"0"); }
 function safeColor(c, fb){ if (typeof c!=="string") return fb; const ok=/^#([0-9A-F]{3}){1,2}$/i.test(c.trim()); return ok?c.trim():fb; }
 
-// normalize: Google Sheets -> state (deps -> Number!)
+// normalize: Google Sheets -> state
 function normalizeModules(apiModules = []) {
   return apiModules.map((m, i) => {
+    // deps_json -> array<number>
     let deps = [];
     if (typeof m.deps_json === "string") {
       try { deps = JSON.parse(m.deps_json) || []; } catch { deps = []; }
     } else if (Array.isArray(m.deps_json)) {
       deps = m.deps_json;
+    } else if (Array.isArray(m.deps)) {
+      deps = m.deps;
     }
     deps = (Array.isArray(deps) ? deps : []).map(x => Number(x)).filter(Number.isFinite);
+
+    // obMode string|null
+    let obMode = null;
+    if (m.obMode === "onb" || m.obMode === "half") obMode = m.obMode;
+
+    // startWeek / duration
+    const startWeek = Number.isFinite(Number(m.startWeek)) ? Number(m.startWeek) : 0;
+    const persistedDuration = Number.isFinite(Number(m.duration)) ? Number(m.duration) : undefined;
 
     return {
       id: Number(m.id ?? i + 1),
@@ -64,10 +72,10 @@ function normalizeModules(apiModules = []) {
       deps,
       enabled: !!m.enabled,
       isMvp: !!m.isMvp,
-      obMode: (typeof m.obMode === 'string' ? m.obMode : (m.obMode ? String(m.obMode) : null)),
-      startWeek: Number.isFinite(Number(m.startWeek)) ? Number(m.startWeek) : 0,
-      // İstersen mevcut duration kolonunu da oku (gerekli değil ama silinmesin diye tutabiliriz)
-      duration: Number.isFinite(Number(m.duration)) ? Number(m.duration) : undefined,
+
+      obMode,
+      startWeek,
+      duration: persistedDuration, // ekranda hesaplıyoruz, fakat kaybolmasın diye tutuyoruz
     };
   });
 }
@@ -110,17 +118,16 @@ function Loading() {
 
 /* ======================= LOGIN WRAPPER ======================= */
 export default function Home(){
-  const [role, setRole] = useState(null); // 'admin' | 'viewer' | null (null => login form)
+  const [role, setRole] = useState(null); // 'admin' | 'viewer' | null
   const [pw, setPw] = useState("");
   const [err, setErr] = useState("");
 
-  // İlk açılışta localStorage'da rol yoksa viewer olarak başla
   useEffect(() => {
     const saved = typeof window !== "undefined" ? localStorage.getItem("role") : null;
     if (saved === "admin" || saved === "viewer") {
       setRole(saved);
     } else {
-      setRole("viewer"); // viewer gibi login
+      setRole("viewer");
       localStorage.setItem("role","viewer");
     }
   }, []);
@@ -134,7 +141,7 @@ export default function Home(){
   }
   function handleLogout(){
     localStorage.removeItem("role");
-    setRole("viewer"); // logout olduğunda viewer'a düş
+    setRole("viewer");
     localStorage.setItem("role","viewer");
     setPw("");
   }
@@ -169,7 +176,7 @@ export default function Home(){
 function TopBar({ role, onLogout, onLogin }){
   return (
     <div style={{display:'flex', alignItems:'center', gap:10, padding:'8px 12px', borderBottom:'1px solid #e5e7eb', background:'#fff'}}>
-      <div style={{ display: "flex", alignItems: "center", gap: "12px", fontWeight: 900 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, fontWeight: 900 }}>
         <img src="/logo.png" alt="Pixup Logo" style={{ height: 80, width: 80, objectFit: "contain" }} />
         Roadmap
       </div>
@@ -200,10 +207,15 @@ function DevGantt({ editable = true }){
   const [colW, setColW] = useState(DEFAULT_COL_W);
   const [err, setErr] = useState("");
 
+  // network guard
+  const autosaveTimer = useRef(null);
+  const autosaveLockedRef = useRef(false); // Save Order sırasında true
+  const destroyRef = useRef(false);
+
   // anti-double-add
   const [adding, setAdding] = useState(false);
   const addLockRef = useRef(false);
-  const nextIdRef = useRef(1); // mount’ta gerçek maxId ile güncellenecek
+  const nextIdRef = useRef(1);
 
   // Sheets load
   async function loadFromSheets() {
@@ -216,6 +228,11 @@ function DevGantt({ editable = true }){
       setModules(norm);
       const initialOrder = data.order?.length ? data.order : norm.map(m => m.id);
       setOrder(initialOrder);
+
+      // ilk yüklemede startWeek -> offsets kur
+      const initOff = deriveOffsetsFromStartWeeks(norm, initialOrder);
+      if (Object.keys(initOff).length) setOffsets(initOff);
+
       const maxId = norm.reduce((mx, m) => Math.max(mx, Number(m.id)||0), 0);
       nextIdRef.current = Math.max(1, maxId + 1);
     } catch (e) {
@@ -225,22 +242,41 @@ function DevGantt({ editable = true }){
       nextIdRef.current = 1;
     }
   }
-  useEffect(() => { loadFromSheets(); }, []);
+  useEffect(() => { loadFromSheets(); return () => { destroyRef.current = true; }; }, []);
 
-  // autosave (viewer için POST kapalı)
-  const saveTimer = useRef(null);
+  // ======= AUTOSAVE (PATCH, kritik kolonları dokunma) =======
+  // - yalnızca admin
+  // - Save Order sırasında kilit
   useEffect(() => {
     if (modules === null) return;
-    if (!editable) return; // viewer → sheets’e yazma
-    clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
-      fetch("/api/sheets", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ modules, order }),
-      }).catch(()=>{});
+    if (!editable) return;
+    if (autosaveLockedRef.current) return;
+
+    clearTimeout(autosaveTimer.current);
+    autosaveTimer.current = setTimeout(async () => {
+      try{
+        // minimal patch: her modülün kritik olmayan alanları
+        const payload = {
+          order,
+          modules: (modules || []).map(minimalModuleWithoutCritical),
+          // flag server side için ipucu (yoksa da sorun değil)
+          preserveColumns: ["startWeek","obMode","duration"]
+        };
+        const res = await fetch("/api/sheets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const t = await safeText(res);
+          throw new Error(`Autosave failed ${res.status}: ${t}`);
+        }
+      }catch(e){
+        if (!destroyRef.current) setErr(String(e?.message || e));
+      }
     }, 800);
-    return () => clearTimeout(saveTimer.current);
+
+    return () => clearTimeout(autosaveTimer.current);
   }, [modules, order, editable]);
 
   // derived
@@ -295,23 +331,19 @@ function DevGantt({ editable = true }){
 
     let offsets = {};
     let baseStarts = [];
-    let durations = [];
 
-    // 1) contiguous başlangıçlar (offset=0 kabul ederek)
+    // contiguous başlangıçlar
     let cur = 0;
     enabled.forEach(m => {
       const d = computeDuration(m);
-      durations.push(d);
       baseStarts.push(cur);
       cur += d;
     });
 
-    // 2) hedef start: varsa startWeek, yoksa contiguous
     const targetStarts = enabled.map((m, i) => (
       Number.isFinite(Number(m.startWeek)) ? Number(m.startWeek) : baseStarts[i]
     ));
 
-    // 3) kümülatif offset çöz
     let cum = 0;
     enabled.forEach((m, i) => {
       const need = targetStarts[i] - (baseStarts[i] + cum);
@@ -322,14 +354,6 @@ function DevGantt({ editable = true }){
     });
     return offsets;
   }
-
-  // İlk yüklemede startWeek'leri ekrana uygula (offsets kur)
-  useEffect(() => {
-    if (!modules || !order) return;
-    if (Object.keys(offsets||{}).length) return; // yalnızca ilk kurulumda
-    const init = deriveOffsetsFromStartWeeks(modules, order);
-    if (Object.keys(init).length) setOffsets(init);
-  }, [modules, order]); // eslint-disable-line
 
   // positions (contiguous + incremental offsets)
   const positioned = useMemo(() => {
@@ -358,6 +382,7 @@ function DevGantt({ editable = true }){
   // actions
   function updateModule(id, patch){
     if (!editable) return;
+    // kritik kolon patche düşerse (örn. obMode) local state’te tut ama AUTOSAVE bunu POST etmesin
     setModules(prev => (prev||[]).map(m => m.id === id ? { ...m, ...patch } : m));
   }
 
@@ -394,7 +419,7 @@ function DevGantt({ editable = true }){
     const patch = { [role]: nextVal };
     if (nextVal > (m[role] ?? 0)) {
       const yes = window.confirm(
-        "Wiil onboarding Applied?\n\nOK = Yes (time: ceil(base/2)+6)\nCancel = No (time: ceil(base/2))"
+        "Onboarding uygulanacak mı?\n\nOK = Evet (süre: ceil(base/2)+6)\nCancel = Hayır (süre: ceil(base/2))"
       );
       patch.obMode = yes ? 'onb' : 'half';
     }
@@ -409,26 +434,17 @@ function DevGantt({ editable = true }){
     updateModule(id, patch);
   }
 
-  // Add Module — üç kat güvenlik
+  // Add Module
   function addModule(e){
     if (!editable) return;
-    if (e && e.preventDefault) e.preventDefault();
-    if (e && e.stopPropagation) e.stopPropagation();
-
-    if (adding) return;
-    if (addLockRef.current) return;
-
-    setAdding(true);
-    addLockRef.current = true;
+    e?.preventDefault?.(); e?.stopPropagation?.();
+    if (adding || addLockRef.current) return;
+    setAdding(true); addLockRef.current = true;
 
     const newId = nextIdRef.current++;
-
     setModules(prev => {
       const list = prev || [];
-      if (list.some(x => Number(x.id) === newId)) {
-        nextIdRef.current = newId + 2;
-        return list;
-      }
+      if (list.some(x => Number(x.id) === newId)) { nextIdRef.current = newId + 2; return list; }
       const newM = {
         id: newId,
         name: 'NEW MODULE',
@@ -441,20 +457,17 @@ function DevGantt({ editable = true }){
         enabled: true,
         isMvp: false,
         obMode: null,
+        startWeek: 0
       };
       return [...list, newM];
     });
-
     setOrder(o => {
       const cur = o || [];
       if (cur.includes(newId)) return cur;
       return [...cur, newId];
     });
 
-    setTimeout(() => {
-      addLockRef.current = false;
-      setAdding(false);
-    }, 250);
+    setTimeout(() => { addLockRef.current = false; setAdding(false); }, 250);
   }
 
   function deleteModule(id){
@@ -490,7 +503,7 @@ function DevGantt({ editable = true }){
     });
   }
 
-  // swap as blocks: select 2 bars
+  // blok swap
   function handleSwapClick(targetId){
     if (!editable) return;
     if (!swapId) { setSwapId(targetId); return; }
@@ -513,15 +526,12 @@ function DevGantt({ editable = true }){
     setSwapId(null);
   }
 
-  // ========== ÖNEMLİ: Kartı itince yalnızca o karta offset veriyoruz ==========
-  // Böylece positioned()'daki cumulativeShift, bu karttan SONRAKİ tüm modülleri
-  // otomatik aynı miktarda taşır → boşluk kalmaz.
+  // nudge: sadece seçilen karta offset ver
   function nudgeGroupFrom(id, dw){
     if (!editable) return;
     if (!dw) return;
     setOffsets(prev => ({ ...(prev||{}), [id]: (prev?.[id]||0) + dw }));
   }
-
   useEffect(() => {
     function onKey(e){
       if (!editable) return;
@@ -544,43 +554,79 @@ function DevGantt({ editable = true }){
     setColW(newColW);
   }
 
-// ---- SAVE ORDER: positioned.start -> startWeek, tek POST ile kalıcı ----
-function saveAllStartWeeks(){
-  const startMap = new Map((positioned || []).map(
-    p => [p.id, Math.max(0, Math.round(p.start))]
-  ));
+  // ---- SAVE ORDER: positioned.start -> startWeek + obMode + duration ----
+  async function saveAllStartWeeks(){
+    if (!editable) return;
+    setErr("");
+    autosaveLockedRef.current = true; // autosave'i kilitle
 
-  const updatedModules = (modules || []).map(m => {
-    const sw = startMap.has(m.id) ? startMap.get(m.id) : m.startWeek;
-    return {
-      ...m,
-        startWeek: Number.isFinite(Number(sw)) ? Number(sw) : 0,
-    obMode: m.obMode ? String(m.obMode) : "",
-    duration: Number(computeDuration(m)),
-    };
-  });
+    try{
+      const startMap = new Map((positioned || []).map(
+        p => [p.id, Math.max(0, Math.round(p.start))]
+      ));
 
-  setModules(updatedModules);
+      const updatedModules = (modules || []).map(m => {
+        const sw = startMap.has(m.id) ? startMap.get(m.id) : m.startWeek;
+        const ob = m.obMode === 'onb' ? 'onb' : (m.obMode === 'half' ? 'half' : "");
+        return {
+          // kritik + nonkritik alanları beraber gönderiyoruz, ama JSON güvenli şekilde:
+          id: m.id,
+          name: m.name,
+          desc: m.desc || '',
+          color: m.color || '#999999',
+          baseDuration: Number(m.baseDuration || 0),
+          baseFe: Number(m.baseFe || 0),
+          baseBe: Number(m.baseBe || 0),
+          baseQa: Number(m.baseQa || 0),
+          fe: Number(m.fe || 0),
+          be: Number(m.be || 0),
+          qa: Number(m.qa || 0),
+          deps: Array.isArray(m.deps) ? m.deps.map(Number).filter(Number.isFinite) : [],
+          enabled: !!m.enabled,
+          isMvp: !!m.isMvp,
+          startWeek: Number.isFinite(Number(sw)) ? Number(sw) : 0,
+          obMode: ob,                                  // "" | "onb" | "half"
+          duration: Number(computeDuration(m)),        // computed
+        };
+      });
 
-  fetch("/api/sheets", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      order,
-    modules: updatedModules.map(m => ({
+      // UI senkron
+      setModules(updatedModules);
 
-        id: m.id,
-        name: m.name,
-        startWeek: Number(m.startWeek),
-      obMode: m.obMode,           // "" | "onb" | "half"
-      duration: Number(m.duration)
-    })),
-    forceColumns: ["startWeek","obMode","duration"]
-  }),
-}).catch(()=>{});
-}
+      const res = await fetch("/api/sheets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          order,
+          modules: updatedModules,
+          // sunucu tarafına “bu 3 kolonu özellikle yazıyorum” diye ipucu (opsiyonel)
+          forceColumns: ["startWeek","obMode","duration"]
+        }),
+      });
+      if (!res.ok){
+        const t = await safeText(res);
+        throw new Error(`Save Order failed ${res.status}: ${t}`);
+      }
+      // success → offsets'i startWeek'e eşitle (ekran taze)
+      const fresh = normalizeModules(updatedModules);
+      const newOff = deriveOffsetsFromStartWeeks(fresh, order);
+      setOffsets(newOff);
+    }catch(e){
+      setErr(String(e?.message || e));
+    }finally{
+      autosaveLockedRef.current = false; // kilidi aç
+    }
+  }
 
-  // check-all (Timeline & Modules)
+  if (modules === null) return <Loading />;
+  // hata bandı
+  const ErrorBand = err ? (
+    <div style={{background:"#FEF2F2", color:"#991B1B", border:"1px solid #FEE2E2", borderRadius:8, padding:12, marginBottom:12, fontWeight:600}}>
+      {String(err)}
+    </div>
+  ) : null;
+
+  // tabs
   const allEnabledTimeline = (modules||[]).every(m => m.isMvp || m.enabled);
   function toggleAllEnabledTimeline(){
     if (!editable) return;
@@ -600,24 +646,9 @@ function saveAllStartWeeks(){
     }));
   }
 
-  if (modules === null) return <Loading />;
-  if (err) {
-    return (
-      <div style={{padding:16}}>
-        <div style={{background:"#FEF2F2", color:"#991B1B", border:"1px solid #FEE2E2", borderRadius:8, padding:12, marginBottom:12, fontWeight:600}}>
-          Sheets error: {err}
-        </div>
-        <button onClick={loadFromSheets}
-                style={{padding:"8px 12px", border:"1px solid #e5e7eb", borderRadius:8, cursor:"pointer"}}>
-          Retry
-        </button>
-      </div>
-    );
-  }
-
-  // tabs
   return (
     <div style={{ background: '#fff', color: '#111827', padding: 12 }}>
+      {ErrorBand}
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12 }}>
         <Tab active={tab==='timeline'} onClick={()=>setTab('timeline')}>Timeline</Tab>
         <Tab active={tab==='modules'} onClick={()=>setTab('modules')}>Modules</Tab>
@@ -627,7 +658,7 @@ function saveAllStartWeeks(){
           <button onClick={()=>zoom(+6)} title="Zoom in"  style={iconBtn()}>+</button>
           <button onClick={fitToScreen} title="Fit to screen" style={iconBtn()}>⤢</button>
 
-          {/* YENİ: Save Order (sadece admin aktif) */}
+          {/* Save Order */}
           <button
             onClick={saveAllStartWeeks}
             disabled={!editable}
@@ -857,35 +888,42 @@ function TimelineView({
               const tColor = textColorFor(m.color);
               const resText = formatRes(m);
               const tip = `${m.name}\n${m.desc ? m.desc + '\n' : ''}${resText ? resText + ' • ' : ''}${m.duration} weeks${m.obMode==='onb' ? ' • OnB' : (m.obMode==='half' ? ' • Half' : '')}`;
-              const labelText = (resText || ' ');              return (
-                <div key={m.id}
-                     onMouseDown={(e)=>{ if(!editable) return; draggingRef.current = { id: m.id, startX: e.clientX }; setIsGrabbing(true); }}
-                     onTouchStart={(e)=>{ if(!editable) return; const t=e.touches[0]; draggingRef.current = { id: m.id, startX: t.clientX }; setIsGrabbing(true); }}
-                     onMouseUp={()=> setIsGrabbing(false)}
-                     onClick={()=>editable && onSwapClick(m.id)}
-                     style={{
-                       position: 'absolute',
-                       left: `${leftPx}px`,
-                       top: `${rowIdx * ROW_H + (ROW_H - BAR_H) / 2}px`,
-                       width: `${barW}px`,
-                       height: `${BAR_H}px`,
-                       background: m.color || '#3498db',
-                       color: tColor,
-                       borderRadius: 10,
-                       display: 'flex',
-                       flexDirection: 'column',
-                       alignItems: 'center',
-                       justifyContent: 'center',
-                       padding: '2px 8px',
-                       boxSizing: 'border-box',
-                       boxShadow: selected? '0 0 0 3px rgba(79,70,229,0.7)' : '0 1px 2px rgba(0,0,0,0.06)',
-                       textAlign: 'center',
-                       lineHeight: 1.1,
-                       cursor: editable ? (isGrabbing ? 'grabbing' : 'grab') : 'default',
-                       userSelect: 'none'
-                     }}
-                     title={tip}>
-                  {m.isMvp && <div style={{position:'absolute', left:6, top:6, fontSize:14, color:'#000'}}>★</div>}
+
+              return (
+                <div
+                  key={m.id}
+                  onMouseDown={(e)=>{ if(!editable) return; draggingRef.current = { id: m.id, startX: e.clientX }; setIsGrabbing(true); }}
+                  onTouchStart={(e)=>{ if(!editable) return; const t=e.touches[0]; draggingRef.current = { id: m.id, startX: t.clientX }; setIsGrabbing(true); }}
+                  onMouseUp={()=> setIsGrabbing(false)}
+                  onClick={()=>editable && onSwapClick(m.id)}
+                  style={{
+                    position: 'absolute',
+                    left: `${leftPx}px`,
+                    top: `${rowIdx * ROW_H + (ROW_H - BAR_H) / 2}px`,
+                    width: `${barW}px`,
+                    height: `${BAR_H}px`,
+                    background: m.color || '#3498db',
+                    color: tColor,
+                    borderRadius: 10,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '2px 8px',
+                    boxSizing: 'border-box',
+                    boxShadow: selected? '0 0 0 3px rgba(79,70,229,0.7)' : '0 1px 2px rgba(0,0,0,0.06)',
+                    textAlign: 'center',
+                    lineHeight: 1.1,
+                    cursor: editable ? (isGrabbing ? 'grabbing' : 'grab') : 'default',
+                    userSelect: 'none'
+                  }}
+                  title={tip}
+                >
+                  {/* MVP star (sol üst) */}
+                  {m.isMvp && (
+                    <div style={{position:'absolute', left:6, top:6, fontSize:14, color:'#000'}}>★</div>
+                  )}
+                  {/* OnB badge (sadece sağ üst) */}
                   {m.obMode==='onb' && (
                     <div style={{
                       position:'absolute', right:6, top:6,
@@ -896,7 +934,7 @@ function TimelineView({
                   )}
                   <div style={{ fontWeight: 800, fontSize: titleFont, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', wordBreak: 'break-word', padding: '0 6px', maxHeight: '2.2em' }}>{m.name}</div>
                   <div style={{ marginTop: 4, fontSize: 12, fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', padding: '2px 6px', borderRadius: 6, backgroundColor: 'rgba(0,0,0,0.36)', color: '#fff', alignSelf: 'center' }}>
-                    {(resText || ' ') + (m.obMode==='onb' ? '  OnB' : '')}
+                    {resText || ' '}
                   </div>
                 </div>
               );
@@ -1103,3 +1141,27 @@ function Tab({ active, onClick, children }){
 function td(){ return { padding: 10, borderBottom: '1px solid #f3f4f6', fontSize: 13, verticalAlign: 'top' }; }
 function inp(w=160){ return { width: w, padding: '6px 8px', border: '1px solid #e5e7eb', borderRadius: 8, fontSize: 13 }; }
 function iconBtn(){ return { width: 32, height: 28, borderRadius: 8, border: '1px solid #e5e7eb', background:'#fff', cursor:'pointer', fontWeight:900 }; }
+
+// ===== helpers (network-safe serialization) =====
+function minimalModuleWithoutCritical(m){
+  return {
+    id: m.id,
+    name: m.name,
+    desc: m.desc || '',
+    color: m.color || '#999999',
+    baseDuration: Number(m.baseDuration || 0),
+    baseFe: Number(m.baseFe || 0),
+    baseBe: Number(m.baseBe || 0),
+    baseQa: Number(m.baseQa || 0),
+    fe: Number(m.fe || 0),
+    be: Number(m.be || 0),
+    qa: Number(m.qa || 0),
+    deps: Array.isArray(m.deps) ? m.deps.map(Number).filter(Number.isFinite) : [],
+    enabled: !!m.enabled,
+    isMvp: !!m.isMvp,
+    // startWeek / obMode / duration BİLEREK GÖNDERİLMİYOR (autosave)
+  };
+}
+async function safeText(res){
+  try{ return await res.text(); }catch{ return ''; }
+}
