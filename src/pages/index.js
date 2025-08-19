@@ -79,26 +79,43 @@ function normalizeModules(apiModules = []) {
     };
   });
 }
-
-// eski scale (ekip dağılımına göre)
-function scaleDuration({ baseDuration, baseFe, baseBe, baseQa, fe, be, qa }) {
+// ham float scale
+function scaleDurationRaw({ baseDuration, baseFe, baseBe, baseQa, fe, be, qa }) {
   const baseDur = Math.max(1, Number(baseDuration ?? 1) || 1);
-  const baseTot = Math.max(1, (Number(baseFe)||0) + (Number(baseBe)||0) + (Number(baseQa)||0));
-  const curTot  = Math.max(1, (Number(fe)||0) + (Number(be)||0) + (Number(qa)||0));
-  const adjusted = Math.round(baseDur * (baseTot / curTot));
-  return Math.max(1, adjusted);
+  const baseTot = Math.max(1,
+    (Number(baseFe)||0) + (Number(baseBe)||0) + (Number(baseQa)||0)
+  );
+  const curTot  = Math.max(1,
+    (Number(fe)||0) + (Number(be)||0) + (Number(qa)||0)
+  );
+  return baseDur * (baseTot / curTot);
 }
-// yeni kural: OB popup seçimine göre override; aksi halde eski scale
+
+// yeni computeDuration
 function computeDuration(m){
   const base = Math.max(1, Number(m.baseDuration)||1);
+
+  // OB override varsa
   if (m.obMode === 'onb')  return Math.ceil(base/2) + 6;
   if (m.obMode === 'half') return Math.max(1, Math.ceil(base/2));
-  return scaleDuration({
-    baseDuration: m.baseDuration, baseFe: m.baseFe, baseBe: m.baseBe, baseQa: m.baseQa,
+
+  const raw = scaleDurationRaw({
+    baseDuration: m.baseDuration,
+    baseFe: m.baseFe, baseBe: m.baseBe, baseQa: m.baseQa,
     fe: m.fe, be: m.be, qa: m.qa,
   });
-}
 
+  const prev = Number.isFinite(Number(m.duration)) ? Number(m.duration) : null;
+  let adjusted;
+
+  if (prev == null) {
+    adjusted = Math.round(raw);
+  } else {
+    adjusted = raw < prev ? Math.floor(raw) : Math.ceil(raw);
+  }
+
+  return Math.max(1, adjusted);
+}
 // ====== Loading ======
 function Loading() {
   return (
