@@ -50,9 +50,8 @@ function normalizeModules(apiModules = []) {
     let obMode = null;
     if (m.obMode === "onb" || m.obMode === "half") obMode = m.obMode;
 
-    // startWeek / duration
+    // startWeek / duration (duration'ı otomatik hesaplıyoruz; elle override için ayrı alan kullanacağız)
     const startWeek = Number.isFinite(Number(m.startWeek)) ? Number(m.startWeek) : 0;
-    const persistedDuration = Number.isFinite(Number(m.duration)) ? Number(m.duration) : undefined;
 
     return {
       id: Number(m.id ?? i + 1),
@@ -75,11 +74,13 @@ function normalizeModules(apiModules = []) {
 
       obMode,
       startWeek,
-      duration: persistedDuration, // ekranda hesaplıyoruz, fakat kaybolmasın diye tutuyoruz
+      // elle override alanı – sheets'ten gelmez; UI'da kullanıcı belirler
+      manualDuration: undefined,
     };
   });
 }
-// ham float scale
+
+// --- duration hesapları ---
 function scaleDurationRaw({ baseDuration, baseFe, baseBe, baseQa, fe, be, qa }) {
   const baseDur = Math.max(1, Number(baseDuration ?? 1) || 1);
   const baseTot = Math.max(1,
@@ -91,31 +92,29 @@ function scaleDurationRaw({ baseDuration, baseFe, baseBe, baseQa, fe, be, qa }) 
   return baseDur * (baseTot / curTot);
 }
 
-// yeni computeDuration
 function computeDuration(m){
   const base = Math.max(1, Number(m.baseDuration)||1);
 
-  // OB override varsa
+  // OB override deterministik
   if (m.obMode === 'onb')  return Math.ceil(base/2) + 6;
   if (m.obMode === 'half') return Math.max(1, Math.ceil(base/2));
 
+  // tam saf hesap – mevcut değerlere göre
   const raw = scaleDurationRaw({
     baseDuration: m.baseDuration,
     baseFe: m.baseFe, baseBe: m.baseBe, baseQa: m.baseQa,
     fe: m.fe, be: m.be, qa: m.qa,
   });
-
-  const prev = Number.isFinite(Number(m.duration)) ? Number(m.duration) : null;
-  let adjusted;
-
-  if (prev == null) {
-    adjusted = Math.round(raw);
-  } else {
-    adjusted = raw < prev ? Math.floor(raw) : Math.ceil(raw);
-  }
-
-  return Math.max(1, adjusted);
+  return Math.max(1, Math.round(raw));
 }
+
+// "etkin süre": kullanıcı override'ı varsa onu kullan
+function effectiveDuration(m){
+  return Number.isFinite(Number(m.manualDuration))
+    ? Math.max(1, Number(m.manualDuration))
+    : computeDuration(m);
+}
+
 // ====== Loading ======
 function Loading() {
   return (
@@ -190,24 +189,76 @@ export default function Home(){
   );
 }
 
-function TopBar({ role, onLogout, onLogin }){
+function TopBar({ role, onLogout, onLogin }) {
   return (
-    <div style={{display:'flex', alignItems:'center', gap:10, padding:'8px 12px', borderBottom:'1px solid #e5e7eb', background:'#fff'}}>
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "10px 16px",
+        borderBottom: "1px solid #001737",
+        background: "#001f3f",           // lacivert
+        color: "#ffffff",                // beyaz yazı
+      }}
+    >
       <div style={{ display: "flex", alignItems: "center", gap: 12, fontWeight: 900 }}>
-        <img src="/logo.png" alt="Pixup Logo" style={{ height: 80, width: 80, objectFit: "contain" }} />
-        Roadmap
+        <img
+          src="/logo.png"
+          alt="Pixup Logo"
+          style={{ height: 80, width: 80, objectFit: "contain" }}
+        />
+        <span style={{ fontSize: 20 }}>Roadmap</span>
       </div>
-      <div style={{marginLeft:'auto', display:'flex', alignItems:'center', gap:8}}>
-        <span style={{
-          fontSize:12, fontWeight:800, padding:'2px 8px', borderRadius:999,
-          background: role==='admin' ? '#d1fae5' : '#e5e7eb', color:'#111827'
-        }}>
+
+      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+        <span
+          style={{
+            fontSize: 12,
+            fontWeight: 800,
+            padding: "2px 8px",
+            borderRadius: 999,
+            background: "rgba(255,255,255,0.15)",   // rozet için yarı saydam beyaz
+            color: "#fff",
+            border: "1px solid rgba(255,255,255,0.2)",
+          }}
+        >
           {role.toUpperCase()}
         </span>
-        {role==='viewer' && <span style={{fontSize:12, color:'#6b7280'}}>View-only</span>}
-        {role==='viewer'
-          ? <button onClick={onLogin} style={{padding:'6px 10px', border:'1px solid #e5e7eb', borderRadius:8, background:'#fff', cursor:'pointer'}}>Login</button>
-          : <button onClick={onLogout} style={{padding:'6px 10px', border:'1px solid #e5e7eb', borderRadius:8, background:'#fff', cursor:'pointer'}}>Logout</button>}
+
+        {role === "viewer" && (
+          <span style={{ fontSize: 12, color: "rgba(255,255,255,0.75)" }}>View-only</span>
+        )}
+
+        {role === "viewer" ? (
+          <button
+            onClick={onLogin}
+            style={{
+              padding: "6px 10px",
+              border: "1px solid rgba(255,255,255,0.35)",
+              borderRadius: 8,
+              background: "transparent",
+              color: "#fff",
+              cursor: "pointer",
+            }}
+          >
+            Login
+          </button>
+        ) : (
+          <button
+            onClick={onLogout}
+            style={{
+              padding: "6px 10px",
+              border: "1px solid rgba(255,255,255,0.35)",
+              borderRadius: 8,
+              background: "transparent",
+              color: "#fff",
+              cursor: "pointer",
+            }}
+          >
+            Logout
+          </button>
+        )}
       </div>
     </div>
   );
@@ -272,11 +323,9 @@ function DevGantt({ editable = true }){
     clearTimeout(autosaveTimer.current);
     autosaveTimer.current = setTimeout(async () => {
       try{
-        // minimal patch: her modülün kritik olmayan alanları
         const payload = {
           order,
           modules: (modules || []).map(minimalModuleWithoutCritical),
-          // flag server side için ipucu (yoksa da sorun değil)
           preserveColumns: ["startWeek","obMode","duration"]
         };
         const res = await fetch("/api/sheets", {
@@ -352,7 +401,7 @@ function DevGantt({ editable = true }){
     // contiguous başlangıçlar
     let cur = 0;
     enabled.forEach(m => {
-      const d = computeDuration(m);
+      const d = effectiveDuration(m);
       baseStarts.push(cur);
       cur += d;
     });
@@ -376,7 +425,7 @@ function DevGantt({ editable = true }){
   const positioned = useMemo(() => {
     let start = 0, cumulativeShift = 0;
     return enabledOrdered.map(m => {
-      const duration = computeDuration(m);
+      const duration = effectiveDuration(m);
       const ownShift = Number(offsets[m.id] || 0);
       cumulativeShift += ownShift;
       const p = { ...m, start: start + cumulativeShift, duration };
@@ -399,7 +448,7 @@ function DevGantt({ editable = true }){
   // actions
   function updateModule(id, patch){
     if (!editable) return;
-    // kritik kolon patche düşerse (örn. obMode) local state’te tut ama AUTOSAVE bunu POST etmesin
+    // kritik kolon patche düşerse (örn. obMode) local state’te tut, autosave POST etmez
     setModules(prev => (prev||[]).map(m => m.id === id ? { ...m, ...patch } : m));
   }
 
@@ -474,7 +523,8 @@ function DevGantt({ editable = true }){
         enabled: true,
         isMvp: false,
         obMode: null,
-        startWeek: 0
+        startWeek: 0,
+        manualDuration: undefined,
       };
       return [...list, newM];
     });
@@ -586,7 +636,7 @@ function DevGantt({ editable = true }){
         const sw = startMap.has(m.id) ? startMap.get(m.id) : m.startWeek;
         const ob = m.obMode === 'onb' ? 'onb' : (m.obMode === 'half' ? 'half' : "");
         return {
-          // kritik + nonkritik alanları beraber gönderiyoruz, ama JSON güvenli şekilde:
+          // kritik + nonkritik alanlar
           id: m.id,
           name: m.name,
           desc: m.desc || '',
@@ -603,12 +653,15 @@ function DevGantt({ editable = true }){
           isMvp: !!m.isMvp,
           startWeek: Number.isFinite(Number(sw)) ? Number(sw) : 0,
           obMode: ob,                                  // "" | "onb" | "half"
-          duration: Number(computeDuration(m)),        // computed
+          duration: Number(effectiveDuration(m)),      // manuel varsa o, yoksa compute
         };
       });
 
       // UI senkron
-      setModules(updatedModules);
+      setModules(prev => prev?.map(m => {
+        const u = updatedModules.find(x => x.id === m.id);
+        return { ...m, startWeek: u.startWeek };
+      }) || updatedModules);
 
       const res = await fetch("/api/sheets", {
         method: "POST",
@@ -616,7 +669,6 @@ function DevGantt({ editable = true }){
         body: JSON.stringify({
           order,
           modules: updatedModules,
-          // sunucu tarafına “bu 3 kolonu özellikle yazıyorum” diye ipucu (opsiyonel)
           forceColumns: ["startWeek","obMode","duration"]
         }),
       });
@@ -624,7 +676,7 @@ function DevGantt({ editable = true }){
         const t = await safeText(res);
         throw new Error(`Save Order failed ${res.status}: ${t}`);
       }
-      // success → offsets'i startWeek'e eşitle (ekran taze)
+      // success → offsets'i startWeek'e eşitle
       const fresh = normalizeModules(updatedModules);
       const newOff = deriveOffsetsFromStartWeeks(fresh, order);
       setOffsets(newOff);
@@ -732,6 +784,8 @@ function DevGantt({ editable = true }){
           allEnabled={allEnabledModules}
           onToggleAll={toggleAllEnabledModules}
           editable={editable}
+          onSetManualDuration={(id, val)=>updateModule(id, { manualDuration: val })}
+          onClearManualDuration={(id)=>updateModule(id, { manualDuration: undefined })}
         />
       )}
 
@@ -829,10 +883,16 @@ function TimelineView({
             const { d, start, end } = simplePath(from, to);
             return (
               <g key={`${depId}->${m.id}`} filter="url(#arrowGlow2)">
-                <circle cx={start.x} cy={start.y} r={2.6} fill={stroke}/>
-                <path d={d} stroke={stroke} strokeWidth={sw} fill="none" markerEnd={`url(#${markerId})`} />
-                <circle cx={end.x} cy={end.y} r={2.6} fill={stroke}/>
-              </g>
+  <circle cx={start.x} cy={start.y} r={2.6} fill={stroke} />
+  <path
+    d={d}
+    stroke={stroke}
+    strokeWidth={sw}
+    fill="none"
+    markerEnd={"url(#" + markerId + ")"}
+  />
+  <circle cx={end.x} cy={end.y} r={2.6} fill={stroke} />
+</g>
             );
           })
         ))}
@@ -936,11 +996,9 @@ function TimelineView({
                   }}
                   title={tip}
                 >
-                  {/* MVP star (sol üst) */}
                   {m.isMvp && (
                     <div style={{position:'absolute', left:6, top:6, fontSize:14, color:'#000'}}>★</div>
                   )}
-                  {/* OnB badge (sadece sağ üst) */}
                   {m.obMode==='onb' && (
                     <div style={{
                       position:'absolute', right:6, top:6,
@@ -970,7 +1028,9 @@ function ModulesEditor({
   onChangeText, onChangeNumber, onResChange,
   onToggleEnabled, onToggleIsMvp,
   onAdd, onDelete, adding, allEnabled, onToggleAll,
-  editable
+  editable,
+  onSetManualDuration,
+  onClearManualDuration
 }){
   return (
     <div style={{ border: '1px solid #e5e7eb', borderRadius: 12, overflow: 'hidden' }}>
@@ -999,63 +1059,89 @@ function ModulesEditor({
           </tr>
         </thead>
         <tbody>
-          {ordered.map(m => (
-            <tr key={m.id} style={{ background: swapId===m.id? '#eef2ff' : '#fff' }}>
-              <td style={td()}>
-                <input type="checkbox"
-                  checked={!!m.enabled}
-                  onChange={()=>editable && onToggleEnabled(m.id)}
-                  disabled={!editable}
-                  title={m.isMvp ? "MVP modules are always enabled" : ""}
-                />
-              </td>
-              <td style={td()}>
-                <input type="checkbox"
-                  checked={!!m.isMvp}
-                  onChange={()=>editable && onToggleIsMvp(m.id)}
-                  disabled={!editable}
-                />
-              </td>
-              <td style={td()}>
-                <input value={m.name} onChange={e=>editable && onChangeText(m.id,{name: e.target.value})} disabled={!editable} style={inp(200)} />
-              </td>
-              <td style={td()}>
-                <textarea value={m.desc || ''} onChange={e=>editable && onChangeText(m.id,{ desc: e.target.value })} disabled={!editable} style={{ ...inp(320), height: 56, resize: 'vertical' }} />
-              </td>
-              <td style={td()}>
-                <input type="number" min={1} value={m.baseDuration} onChange={e=>editable && onChangeNumber(m.id,'baseDuration', Math.max(1, Number(e.target.value)||1))} disabled={!editable} style={inp(56)} />
-              </td>
-              <td style={td()}>
-                <input type="number" min={0} value={m.fe} onChange={(e)=>editable && onResChange(m.id,'fe', e.target.value)} disabled={!editable} style={inp(44)} />
-              </td>
-              <td style={td()}>
-                <input type="number" min={0} value={m.be} onChange={(e)=>editable && onResChange(m.id,'be', e.target.value)} disabled={!editable} style={inp(44)} />
-              </td>
-              <td style={td()}>
-                <input type="number" min={0} value={m.qa} onChange={(e)=>editable && onResChange(m.id,'qa', e.target.value)} disabled={!editable} style={inp(44)} />
-              </td>
-              <td style={td()}>
-                <input type="color" value={m.color} onChange={(e)=>editable && onChangeText(m.id,{ color: e.target.value })} disabled={!editable} style={{ width: 40, height: 28, padding: 0, border: 'none', background: 'transparent', cursor: editable ? 'pointer':'default' }} />
-              </td>
-              <td style={td()}>
-                <DepDropdown
-                  value={(m.deps||[]).map(Number)}
-                  options={ordered.filter(x=>x.id!==m.id).map(opt => ({ value: Number(opt.id), label: opt.name }))}
-                  onChange={(values)=> editable && onChangeText(m.id, { deps: values })}
-                  disabled={!editable}
-                />
-              </td>
-              <td style={td()}><strong>{computeDuration(m)}</strong>{m.obMode==='onb' ? '  (OnB)' : (m.obMode==='half' ? '  (Half)' : '')}</td>
-              <td style={td()}>
-                <button type="button" onClick={()=>editable && onSwapClick(m.id)} disabled={!editable} style={{ padding:'6px 8px', border:'1px solid #e5e7eb', borderRadius:6, background: swapId===m.id? '#eef2ff':'#fff', cursor: editable ? 'pointer':'default', opacity: editable ? 1 : 0.6 }}>Pick</button>
-              </td>
-              <td style={{ ...td(), width: 60 }}>
-                <button type="button" title="Delete" onClick={()=>editable && onDelete?.(m.id)}
-                        disabled={!editable}
-                        style={{ width: 36, height: 28, borderRadius: 6, border: '1px solid #fee2e2', background: '#fef2f2', color:'#dc2626', fontWeight: 800, cursor: editable ? 'pointer':'default', opacity: editable ? 1 : 0.6 }}>🗑</button>
-              </td>
-            </tr>
-          ))}
+          {ordered.map(m => {
+            const val = effectiveDuration(m);
+            const isManual = Number.isFinite(Number(m.manualDuration));
+            return (
+              <tr key={m.id} style={{ background: swapId===m.id? '#eef2ff' : '#fff' }}>
+                <td style={td()}>
+                  <input type="checkbox"
+                    checked={!!m.enabled}
+                    onChange={()=>editable && onToggleEnabled(m.id)}
+                    disabled={!editable}
+                    title={m.isMvp ? "MVP modules are always enabled" : ""}
+                  />
+                </td>
+                <td style={td()}>
+                  <input type="checkbox"
+                    checked={!!m.isMvp}
+                    onChange={()=>editable && onToggleIsMvp(m.id)}
+                    disabled={!editable}
+                  />
+                </td>
+                <td style={td()}>
+                  <input value={m.name} onChange={e=>editable && onChangeText(m.id,{name: e.target.value})} disabled={!editable} style={inp(200)} />
+                </td>
+                <td style={td()}>
+                  <textarea value={m.desc || ''} onChange={e=>editable && onChangeText(m.id,{ desc: e.target.value })} disabled={!editable} style={{ ...inp(320), height: 56, resize: 'vertical' }} />
+                </td>
+                <td style={td()}>
+                  <input type="number" min={1} value={m.baseDuration} onChange={e=>editable && onChangeNumber(m.id,'baseDuration', Math.max(1, Number(e.target.value)||1))} disabled={!editable} style={inp(56)} />
+                </td>
+                <td style={td()}>
+                  <input type="number" min={0} value={m.fe} onChange={(e)=>editable && onResChange(m.id,'fe', e.target.value)} disabled={!editable} style={inp(44)} />
+                </td>
+                <td style={td()}>
+                  <input type="number" min={0} value={m.be} onChange={(e)=>editable && onResChange(m.id,'be', e.target.value)} disabled={!editable} style={inp(44)} />
+                </td>
+                <td style={td()}>
+                  <input type="number" min={0} value={m.qa} onChange={(e)=>editable && onResChange(m.id,'qa', e.target.value)} disabled={!editable} style={inp(44)} />
+                </td>
+                <td style={td()}>
+                  <input type="color" value={m.color} onChange={(e)=>editable && onChangeText(m.id,{ color: e.target.value })} disabled={!editable} style={{ width: 40, height: 28, padding: 0, border: 'none', background: 'transparent', cursor: editable ? 'pointer':'default' }} />
+                </td>
+                <td style={td()}>
+                  <DepDropdown
+                    value={(m.deps||[]).map(Number)}
+                    options={ordered.filter(x=>x.id!==m.id).map(opt => ({ value: Number(opt.id), label: opt.name }))}
+                    onChange={(values)=> editable && onChangeText(m.id, { deps: values })}
+                    disabled={!editable}
+                  />
+                </td>
+                <td style={{ ...td(), whiteSpace:'nowrap' }}>
+                  <input
+                    type="number"
+                    min={1}
+                    value={val}
+                    onChange={e=>{
+                      if (!editable) return;
+                      const n = Math.max(1, Number(e.target.value)||1);
+                      onSetManualDuration?.(m.id, n);
+                    }}
+                    disabled={!editable}
+                    style={inp(70)}
+                    title={isManual ? 'Manual override' : 'Auto (computed)'}
+                  />
+                  <button
+                    type="button"
+                    onClick={()=> editable && onClearManualDuration?.(m.id)}
+                    disabled={!editable}
+                    style={{ marginLeft:6, padding:'4px 8px', border:'1px solid #e5e7eb', borderRadius:6, background:'#fff', cursor: editable ? 'pointer':'default' }}>
+                    Auto
+                  </button>
+                  {m.obMode==='onb' ? '  (OnB)' : (m.obMode==='half' ? '  (Half)' : (isManual ? '  (Manual)' : ''))}
+                </td>
+                <td style={td()}>
+                  <button type="button" onClick={()=>editable && onSwapClick(m.id)} disabled={!editable} style={{ padding:'6px 8px', border:'1px solid #e5e7eb', borderRadius:6, background: swapId===m.id? '#eef2ff':'#fff', cursor: editable ? 'pointer':'default', opacity: editable ? 1 : 0.6 }}>Pick</button>
+                </td>
+                <td style={{ ...td(), width: 60 }}>
+                  <button type="button" title="Delete" onClick={()=>editable && onDelete?.(m.id)}
+                          disabled={!editable}
+                          style={{ width: 36, height: 28, borderRadius: 6, border: '1px solid #fee2e2', background: '#fef2f2', color:'#dc2626', fontWeight: 800, cursor: editable ? 'pointer':'default', opacity: editable ? 1 : 0.6 }}>🗑</button>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
